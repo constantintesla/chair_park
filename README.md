@@ -1,12 +1,6 @@
-Ниже готовые файлы, которые можно сразу положить в корень репозитория.
-
----
-
-### `README.md`
 ```markdown
 # YOLO-pose Sit-to-Stand Analyzer  
-**Соответствует протоколу 6.5.1.7 «Вставание с кресла (0-4)»**
-
+ 
 ## Кратко
 Двух-шаговый пайплайн:  
 1. `pose_tracker.py` — извлекает ключевые точки из видео (YOLOv8-pose) и сохраняет их в CSV.  
@@ -70,46 +64,3 @@ python movement_analysis.py --input keypoints.csv --plot
 ## Зависимости
 См. `requirements.txt`
 
-## Лицензия
-MIT
-```
-
----
-
-### `.gitignore`
-```gitignore
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-env/
-ENV/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Модель и артефакты
-yolov8*.pt
-*.mp4
-*.avi
-*.mov
-*.csv
-*.json
-!requirements.txt
-!README.md
-!pose_tracker.py
-!movement_analysis.py
-
-# OS
-.DS_Store
-Thumbs.db
-```
-
-Сохраните оба файла в корень проекта – и репозиторий готов к публикации.

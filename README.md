@@ -1,4 +1,4 @@
-```markdown
+
 # YOLO-pose Sit-to-Stand Analyzer  
  
 ## Кратко

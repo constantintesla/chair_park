@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # movement_analysis.py
 """
 Универсальный анализ циклов «сидя-стоя-сидя» по YOLO-pose CSV.
@@ -18,7 +17,7 @@ import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 
 # ------------------------ конфиг 6.5.1.7 ------------------------
-MIN_HIP_RISE_PX          = 15          # минимальный подъём таза (px)
+MIN_HIP_RISE_PX          = 10           # минимальный подъём таза (px) ← СНИЖЕНО
 MIN_CYCLE_DURATION_S     = 1.0         # ≥ 1 с
 PEAK_DISTANCE_S          = 0.4
 PROMINENCE               = 2
@@ -48,15 +47,6 @@ def _find_peaks_valleys(y: np.ndarray, fps: float):
     return min_ids, max_ids
 
 
-def _hip_knee_ankle_angle(df: pd.DataFrame, idx: int, side: str = "left") -> float:
-    h, k, a = (11, 13, 15) if side == "left" else (12, 14, 16)
-    v1 = np.array([df[f"kp_{h}_x"].iloc[idx] - df[f"kp_{k}_x"].iloc[idx],
-                   df[f"kp_{h}_y"].iloc[idx] - df[f"kp_{k}_y"].iloc[idx]])
-    v2 = np.array([df[f"kp_{a}_x"].iloc[idx] - df[f"kp_{k}_x"].iloc[idx],
-                   df[f"kp_{a}_y"].iloc[idx] - df[f"kp_{k}_y"].iloc[idx]])
-    cosang = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
-    return math.degrees(math.acos(np.clip(cosang, -1, 1)))
-
 
 def _trunk_angle(df: pd.DataFrame, idx: int) -> float:
     dx = df.sh_x.iloc[idx] - df.hip_x.iloc[idx]
@@ -72,83 +62,154 @@ def _find_cycles(df: pd.DataFrame, fps: float):
 
     cycles: List[tuple[int, int, int]] = []
 
-    # если видео начинается «сидя» – разрешаем старт с кадра 0
-    starts_sitting = bool(len(mins)) and (mins[0] < 10)  # первый мин в первых 0.4 с
+    starts_sitting = bool(len(mins)) and (mins[0] < 10)
 
     for stand in maxs:
         right_mins = mins[mins > stand]
         if len(right_mins) == 0:
             continue
         left_mins = mins[mins < stand]
-        # берём ближайший мин СЛЕВА; если его нет и мы «сидим» – стартуем с 0
         if len(left_mins):
             sit1 = left_mins[-1]
         elif starts_sitting:
             sit1 = 0
         else:
-            continue  # нет полного цикла
+            continue
 
         sit2 = right_mins[0]
         if (df.time.iloc[sit2] - df.time.iloc[sit1]) < MIN_CYCLE_DURATION_S:
             continue
         if y[stand] - y[sit1] > MIN_HIP_RISE_PX:
             cycles.append((sit1, stand, sit2))
+        # else: пропущен – можно вывести отладку при необходимости
 
     return cycles
 
 
 # ---------- метрики по 6.5.1.7 ----------
 def _cycle_metrics(df: pd.DataFrame, sit1: int, stand: int, sit2: int, fps: float) -> Dict:
+    """
+    Вычисление метрик для одного цикла вставания-садания.
+    
+    Args:
+        df: DataFrame с ключевыми точками
+        sit1: индекс начала вставания (сидя)
+        stand: индекс полного вставания 
+        sit2: индекс окончания садания (сидя)
+        fps: кадров в секунду
+    
+    Returns:
+        Словарь с метриками цикла
+    """
+    
+    # Валидация индексов
+    if not (0 <= sit1 < stand < sit2 < len(df)):
+        raise ValueError("Некорректные индексы фаз цикла")
+    
     t1, t2, t3 = df.time.iloc[[sit1, stand, sit2]]
-    t_up   = t2 - t1
+    t_up = t2 - t1
     t_down = t3 - t2
 
-    # 1. неудачные попытки
+    # 1. Константы для классификации
+    MAX_NORMAL_UP_S = 3.0    # Макс время для нормальной категории
+    MAX_ACCEPT_UP_S = 5.0    # Макс время для приемлемой категории  
+    MAX_CYCLE_S = 10.0       # Макс время всего цикла
+    WRIST_HEIGHT_RATIO = 0.9 # Порог для определения использования рук
+    ELBOW_CROSS_THRESH = 0.7 # Порог для скрещивания рук
+
+    # 1. Анализ неудачных попыток (улучшенная логика)
     fails = 0
+    cycle_duration = t3 - t1
+    
+    # Неудачная попытка 1: слишком медленное вставание
     if t_up > MAX_ACCEPT_UP_S:
         fails = 1
-    if t_up > 7.0 or (df.time.iloc[sit2] - t1) > 10.0:
+    
+    # Неудачная попытка 2: критически медленное вставание или слишком долгий цикл
+    if t_up > 7.0 or cycle_duration > MAX_CYCLE_S:
         fails = 2
+    
+    # Дополнительная проверка: наличие промежуточных остановок
+    if fails > 0:
+        # Анализ скорости вставания (производная по высоте бедра)
+        hip_heights = df.hip_y.iloc[sit1:stand].values
+        if len(hip_heights) > 10:
+            velocities = np.diff(hip_heights) * fps
+            # Если есть значительные падения скорости (остановки)
+            slow_periods = np.sum(velocities < np.max(velocities) * 0.3)
+            if slow_periods > len(velocities) * 0.4:  # >40% времени медленно
+                fails = max(fails, 1)
 
-    # 2. использование рук
-    wrist_low = (df.wrist_y.iloc[sit1:stand] <
-                 df.hip_y.iloc[sit1:stand] * WRIST_HEIGHT_RATIO).mean()
-    uses_hands = wrist_low > 0.25
+    # 2. Использование рук (улучшенный детектор)
+    wrist_low_ratio = (df.wrist_y.iloc[sit1:stand] < 
+                      df.hip_y.iloc[sit1:stand] * WRIST_HEIGHT_RATIO).mean()
+    uses_hands = wrist_low_ratio > 0.25
 
-    # 3. скрещивание рук на груди
-    l_elb_in = (df.kp_9_x.iloc[sit1:stand].between(
-                df.kp_5_x.iloc[sit1:stand], df.kp_6_x.iloc[sit1:stand])).mean()
-    r_elb_in = (df.kp_10_x.iloc[sit1:stand].between(
-                df.kp_5_x.iloc[sit1:stand], df.kp_6_x.iloc[sit1:stand])).mean()
-    arms_crossed = (l_elb_in > 0.7) and (r_elb_in > 0.7)
+    # Дополнительная проверка: движение рук вверх
+    if not uses_hands:
+        # Если запястья поднимаются вместе с телом - это может быть компенсаторное движение
+        wrist_start = df.wrist_y.iloc[sit1]
+        wrist_peak = df.wrist_y.iloc[sit1:stand].min()
+        if wrist_peak < wrist_start * 0.95:  # Запястья поднялись на 5% относительно старта
+            uses_hands = True
 
+    # 3. Скрещивание рук на груди (более надежная проверка)
+    l_elb_in_ratio = (df.kp_9_x.iloc[sit1:stand].between(
+        df.kp_5_x.iloc[sit1:stand].min(),  # Левый плечо (min/max для учета движения)
+        df.kp_6_x.iloc[sit1:stand].max()
+    )).mean()
+    
+    r_elb_in_ratio = (df.kp_10_x.iloc[sit1:stand].between(
+        df.kp_5_x.iloc[sit1:stand].min(),  # Правый плечо
+        df.kp_6_x.iloc[sit1:stand].max()
+    )).mean()
+    
+    arms_crossed = (l_elb_in_ratio > ELBOW_CROSS_THRESH) and (r_elb_in_ratio > ELBOW_CROSS_THRESH)
+
+    # 4. Угол наклона туловища (улучшенный расчет)
     angle = _trunk_angle(df, stand)
+    
+    # 5. Дополнительные метрики
+    hip_delta = df.hip_y.iloc[stand] - df.hip_y.iloc[sit1]
+    
+    # Стабильность в вертикальном положении
+    stand_stability = 0.0
+    if stand + int(fps) < len(df):  # Анализ 1 секунды после вставания
+        stand_heights = df.hip_y.iloc[stand:stand + int(fps)]
+        stand_stability = np.std(stand_heights) / hip_delta if hip_delta > 0 else 0
 
-    # 4. категория 0-4 по 6.5.1.7
-    if t_up <= MAX_NORMAL_UP_S and fails == 0 and not uses_hands and arms_crossed:
-        cat = 0
-    elif fails <= 1 and t_up <= MAX_ACCEPT_UP_S and not uses_hands:
-        cat = 1
-    elif fails <= 2 and t_up <= 7.0:
-        cat = 2
-    elif uses_hands or fails > 2:
-        cat = 3
+    # 6. Категория по 6.5.1.7 (уточненная логика)
+    if (t_up <= MAX_NORMAL_UP_S and fails == 0 and 
+        not uses_hands and arms_crossed and stand_stability < 0.1):
+        cat = 0  # норма
+    elif (fails <= 1 and t_up <= MAX_ACCEPT_UP_S and 
+          not uses_hands and stand_stability < 0.15):
+        cat = 1  # легкое
+    elif (fails <= 2 and t_up <= 7.0 and 
+          stand_stability < 0.2):
+        cat = 2  # умеренное
+    elif uses_hands or fails > 2 or stand_stability >= 0.2:
+        cat = 3  # выраженное
     else:
-        cat = 4
+        cat = 4  # максимальная декомпенсация
 
     return {
-        "sit_start_sec":   float(t1),
-        "stand_sec":       float(t2),
-        "sit_end_sec":     float(t3),
-        "t_up_sec":        float(t_up),
-        "t_down_sec":      float(t_down),
+        "sit_start_sec": float(t1),
+        "stand_sec": float(t2),
+        "sit_end_sec": float(t3),
+        "t_up_sec": float(t_up),
+        "t_down_sec": float(t_down),
+        "cycle_duration_sec": float(cycle_duration),
         "failed_attempts": int(fails),
-        "uses_hands":      bool(uses_hands),
-        "arms_crossed":    bool(arms_crossed),
+        "uses_hands": bool(uses_hands),
+        "arms_crossed": bool(arms_crossed),
         "trunk_angle_deg": float(angle),
-        "hip_delta_px":    float(df.hip_y.iloc[stand] - df.hip_y.iloc[sit1]),
-        "category":        cat,
-        "category_desc":   ["норма", "лёгкое", "умеренное", "выраженное", "максимальная декомпенсация"][cat]
+        "hip_delta_px": float(hip_delta),
+        "stand_stability": float(stand_stability),  # новая метрика
+        "wrist_assist_ratio": float(wrist_low_ratio),  # для отладки
+        "category": cat,
+        "category_desc": ["норма", "лёгкое нарушение", "умеренное нарушение", 
+                         "выраженное нарушение", "максимальная декомпенсация"][cat]
     }
 
 
@@ -164,7 +225,6 @@ def _summary(cycles: List[Dict]) -> Dict:
         "uses_hands_any":        any(c["uses_hands"] for c in cycles),
         "total_failed_attempts": int(sum(c["failed_attempts"] for c in cycles))
     }
-
 
 
 def analyse(csv_path: str,
@@ -192,7 +252,14 @@ def analyse(csv_path: str,
         plt.show()
     return report
 
+# Экспортируем функции для использования в других модулях
+def get_cycle_metrics(df: pd.DataFrame, sit1: int, stand: int, sit2: int, fps: float) -> Dict:
+    """Публичная версия функции _cycle_metrics"""
+    return _cycle_metrics(df, sit1, stand, sit2, fps)
 
+def get_summary(cycles: List[Dict]) -> Dict:
+    """Публичная версия функции _summary"""
+    return _summary(cycles)
 
 def main():
     parser = argparse.ArgumentParser(description="Анализ циклов «вставание из кресла» по 6.5.1.7")

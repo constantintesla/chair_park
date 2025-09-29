@@ -77,7 +77,7 @@ class SimpleSmoother:
 
 def process_video(input_path, output_path, show=False, smoothing=True):
     # Загрузка модели YOLOv8 Pose
-    model = YOLO('yolov8s-pose.pt')
+    model = YOLO('yolo11s-pose.pt')
     
     # Инициализация сглаживателя
     if smoothing:

@@ -35,3 +35,4 @@ yolov8*.pt
 # OS
 .DS_Store
 Thumbs.db
+*.pt

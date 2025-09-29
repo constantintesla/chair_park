@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Анализ функциональной пробы «Вставание с кресла» (5 подъёмов)
-на основе CSV-файла с трекингом ключевых точек тела.
-
-Три состояния рук:
-  - pushed_off_chair  – опирался кистью на сидушку ≥ 0.3 с
-  - hands_on_chest    – держал руки на груди всё время
-  - no_arm_contact    – ни опоры, ни «на груди»
-"""
-
 import argparse
 import json
 import sys
@@ -55,7 +45,6 @@ def detect_cycles(keypoints: pd.DataFrame, fps: float, min_duration: float):
         start = i
         while i < n - 1 and grad[i] > -0.5:
             i += 1
-        peak = i
         while i < n - 1 and hip_smooth[i] > sit_threshold:
             i += 1
         end = i
@@ -166,7 +155,7 @@ def analyse(input_csv: str, min_cycle_duration: float, plot: bool):
             "details": {"cycle_durations": [], "total_cycles_detected": 0},
         }
 
-    relevant = cycles[:5]
+    relevant = cycles
     durations = [d for _, _, d in relevant]
     completion_time = sum(durations)
 

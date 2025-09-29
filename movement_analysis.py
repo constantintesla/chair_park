@@ -1,279 +1,244 @@
-# movement_analysis.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Универсальный анализ циклов «сидя-стоя-сидя» по YOLO-pose CSV.
-соответствует протоколу 6.5.1.7 «Вставание с кресла (0-4)».
+Анализ функциональной пробы «Вставание с кресла» (5 подъёмов)
+на основе CSV-файла с трекингом ключевых точек тела.
+
+Три состояния рук:
+  - pushed_off_chair  – опирался кистью на сидушку ≥ 0.3 с
+  - hands_on_chest    – держал руки на груди всё время
+  - no_arm_contact    – ни опоры, ни «на груди»
 """
 
-from __future__ import annotations
 import argparse
 import json
-import math
-import pathlib
-from typing import List, Dict
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
-
-# ------------------------ конфиг 6.5.1.7 ------------------------
-MIN_HIP_RISE_PX          = 10           # минимальный подъём таза (px) ← СНИЖЕНО
-MIN_CYCLE_DURATION_S     = 1.0         # ≥ 1 с
-PEAK_DISTANCE_S          = 0.4
-PROMINENCE               = 2
-WRIST_HEIGHT_RATIO       = 0.35
-TRUNK_ANGLE_THRESHOLD    = 50
-# новые пороги по протоколу
-MAX_NORMAL_UP_S     = 2.0   # норма ≤ 2 с
-MAX_ACCEPT_UP_S     = 5.0   # лёгкое нарушение ≤ 5 с
-# ---------------------------------------------------------------
 
 
-def load_keypoints(csv_path: str) -> pd.DataFrame:
-    """Загружает CSV и добавляет производные столбцы."""
-    df = pd.read_csv(csv_path)
-    df["hip_y"]   = (df.kp_11_y + df.kp_12_y) / 2
-    df["hip_x"]   = (df.kp_11_x + df.kp_12_x) / 2
-    df["sh_y"]    = (df.kp_5_y  + df.kp_6_y)  / 2
-    df["sh_x"]    = (df.kp_5_x  + df.kp_6_x)  / 2
-    df["wrist_y"] = (df.kp_9_y  + df.kp_10_y) / 2
-    return df
+# ----------  Утилиты  ----------
+def normalize_keypoint_name(c: str) -> str:
+    return c.replace("kp_", "")
 
 
-def _find_peaks_valleys(y: np.ndarray, fps: float):
-    distance = int(fps * PEAK_DISTANCE_S)
-    min_ids, _ = find_peaks(-y, distance=distance, prominence=PROMINENCE)
-    max_ids, _ = find_peaks(y,  distance=distance, prominence=PROMINENCE)
-    return min_ids, max_ids
+def hip_height(keypoints: pd.DataFrame, t: int) -> float:
+    return (keypoints.loc[t, "11_y"] + keypoints.loc[t, "12_y"]) / 2.0
 
 
+def shoulder_speed(keypoints: pd.DataFrame, t: int, fps: float) -> float:
+    if t == 0:
+        return 0.0
+    dt = 1.0 / fps
+    dx = keypoints.loc[t, "5_x"] - keypoints.loc[t - 1, "5_x"]
+    dy = keypoints.loc[t, "5_y"] - keypoints.loc[t - 1, "5_y"]
+    return np.hypot(dx, dy) / dt
 
-def _trunk_angle(df: pd.DataFrame, idx: int) -> float:
-    dx = df.sh_x.iloc[idx] - df.hip_x.iloc[idx]
-    dy = df.hip_y.iloc[idx] - df.sh_y.iloc[idx]
-    return math.degrees(math.atan2(dx, dy))
 
+# ----------  Детектор циклов  ----------
+def detect_cycles(keypoints: pd.DataFrame, fps: float, min_duration: float):
+    hip = np.array([hip_height(keypoints, t) for t in range(len(keypoints))])
+    kernel = np.ones(5) / 5
+    hip_smooth = np.convolve(hip, kernel, mode="same")
+    grad = np.gradient(hip_smooth)
+    sit_threshold = np.percentile(hip_smooth, 10)
 
-# ---------- универсальный поиск циклов ----------
-def _find_cycles(df: pd.DataFrame, fps: float):
-    window = max(5, int(fps * 0.20))
-    y = df.hip_y.rolling(window, min_periods=1, center=False).mean().values
-    mins, maxs = _find_peaks_valleys(y, fps)
-
-    cycles: List[tuple[int, int, int]] = []
-
-    starts_sitting = bool(len(mins)) and (mins[0] < 10)
-
-    for stand in maxs:
-        right_mins = mins[mins > stand]
-        if len(right_mins) == 0:
+    cycles, n = [], len(grad)
+    i = 0
+    while i < n - 1:
+        if grad[i] < 0.5:
+            i += 1
             continue
-        left_mins = mins[mins < stand]
-        if len(left_mins):
-            sit1 = left_mins[-1]
-        elif starts_sitting:
-            sit1 = 0
-        else:
-            continue
-
-        sit2 = right_mins[0]
-        if (df.time.iloc[sit2] - df.time.iloc[sit1]) < MIN_CYCLE_DURATION_S:
-            continue
-        if y[stand] - y[sit1] > MIN_HIP_RISE_PX:
-            cycles.append((sit1, stand, sit2))
-        # else: пропущен – можно вывести отладку при необходимости
-
+        start = i
+        while i < n - 1 and grad[i] > -0.5:
+            i += 1
+        peak = i
+        while i < n - 1 and hip_smooth[i] > sit_threshold:
+            i += 1
+        end = i
+        duration = (end - start) / fps
+        if duration >= min_duration:
+            cycles.append((start, end, duration))
+        i += 1
     return cycles
 
 
-# ---------- метрики по 6.5.1.7 ----------
-def _cycle_metrics(df: pd.DataFrame, sit1: int, stand: int, sit2: int, fps: float) -> Dict:
-    """
-    Вычисление метрик для одного цикла вставания-садания.
-    
-    Args:
-        df: DataFrame с ключевыми точками
-        sit1: индекс начала вставания (сидя)
-        stand: индекс полного вставания 
-        sit2: индекс окончания садания (сидя)
-        fps: кадров в секунду
-    
-    Returns:
-        Словарь с метриками цикла
-    """
-    
-    # Валидация индексов
-    if not (0 <= sit1 < stand < sit2 < len(df)):
-        raise ValueError("Некорректные индексы фаз цикла")
-    
-    t1, t2, t3 = df.time.iloc[[sit1, stand, sit2]]
-    t_up = t2 - t1
-    t_down = t3 - t2
+# ----------  Попытки (первые 2 с)  ----------
+def detect_attempts(df: pd.DataFrame, fps: float) -> int:
+    speed = [shoulder_speed(df, t, fps) for t in range(len(df))]
+    time = df["time"].values
+    mask = time <= 2.0
+    speed = np.array(speed) * mask
+    thd, attempts, last = 50.0, 0, -np.inf
+    for t, v in enumerate(speed):
+        if v > thd and (time[t] - last) > 0.3:
+            attempts += 1
+            last = time[t]
+    return max(attempts, 1)
 
-    # 1. Константы для классификации
-    MAX_NORMAL_UP_S = 3.0    # Макс время для нормальной категории
-    MAX_ACCEPT_UP_S = 5.0    # Макс время для приемлемой категории  
-    MAX_CYCLE_S = 10.0       # Макс время всего цикла
-    WRIST_HEIGHT_RATIO = 0.9 # Порог для определения использования рук
-    ELBOW_CROSS_THRESH = 0.7 # Порог для скрещивания рук
 
-    # 1. Анализ неудачных попыток (улучшенная логика)
-    fails = 0
-    cycle_duration = t3 - t1
-    
-    # Неудачная попытка 1: слишком медленное вставание
-    if t_up > MAX_ACCEPT_UP_S:
-        fails = 1
-    
-    # Неудачная попытка 2: критически медленное вставание или слишком долгий цикл
-    if t_up > 7.0 or cycle_duration > MAX_CYCLE_S:
-        fails = 2
-    
-    # Дополнительная проверка: наличие промежуточных остановок
-    if fails > 0:
-        # Анализ скорости вставания (производная по высоте бедра)
-        hip_heights = df.hip_y.iloc[sit1:stand].values
-        if len(hip_heights) > 10:
-            velocities = np.diff(hip_heights) * fps
-            # Если есть значительные падения скорости (остановки)
-            slow_periods = np.sum(velocities < np.max(velocities) * 0.3)
-            if slow_periods > len(velocities) * 0.4:  # >40% времени медленно
-                fails = max(fails, 1)
+# ----------  Три состояния рук  ----------
+def detect_arm_status(df: pd.DataFrame) -> dict:
+    # 1. Опора на сидушку (кисть 9 внутри прямоугольника ≥ 0.3 с)
+    seat_top = np.percentile(df["11_y"], 5)
+    seat_bot = np.percentile(df["11_y"], 25)
+    seat_l   = np.percentile(df["11_x"], 10)
+    seat_r   = np.percentile(df["11_x"], 90)
 
-    # 2. Использование рук (улучшенный детектор)
-    wrist_low_ratio = (df.wrist_y.iloc[sit1:stand] < 
-                      df.hip_y.iloc[sit1:stand] * WRIST_HEIGHT_RATIO).mean()
-    uses_hands = wrist_low_ratio > 0.25
+    inside = (seat_l < df["9_x"]) & (df["9_x"] < seat_r) & \
+             (seat_top < df["9_y"]) & (df["9_y"] < seat_bot)
+    fps = len(df) / df["time"].iloc[-1]
+    min_frames = int(0.3 * fps)
+    pushed_off = (inside.rolling(window=min_frames, center=False).min() == 1).any()
 
-    # Дополнительная проверка: движение рук вверх
-    if not uses_hands:
-        # Если запястья поднимаются вместе с телом - это может быть компенсаторное движение
-        wrist_start = df.wrist_y.iloc[sit1]
-        wrist_peak = df.wrist_y.iloc[sit1:stand].min()
-        if wrist_peak < wrist_start * 0.95:  # Запястья поднялись на 5% относительно старта
-            uses_hands = True
+    # 2. Руки на груди (допускаем 5 % «выбросов»)
+    shoulder_y = (df["5_y"] + df["6_y"]) / 2
+    hip_y      = (df["11_y"] + df["12_y"]) / 2
+    body_size  = np.abs(shoulder_y - hip_y).mean()
+    chest_band = 0.15 * body_size
+    on_chest = (np.abs(df["9_y"]  - shoulder_y) < chest_band) & \
+               (np.abs(df["10_y"] - shoulder_y) < chest_band)
+    # разрешаем 5 % кадров вне зоны
+    hands_on_chest = on_chest.mean() >= 0.95
 
-    # 3. Скрещивание рук на груди (более надежная проверка)
-    l_elb_in_ratio = (df.kp_9_x.iloc[sit1:stand].between(
-        df.kp_5_x.iloc[sit1:stand].min(),  # Левый плечо (min/max для учета движения)
-        df.kp_6_x.iloc[sit1:stand].max()
-    )).mean()
-    
-    r_elb_in_ratio = (df.kp_10_x.iloc[sit1:stand].between(
-        df.kp_5_x.iloc[sit1:stand].min(),  # Правый плечо
-        df.kp_6_x.iloc[sit1:stand].max()
-    )).mean()
-    
-    arms_crossed = (l_elb_in_ratio > ELBOW_CROSS_THRESH) and (r_elb_in_ratio > ELBOW_CROSS_THRESH)
+    # 3. Итог
+    if pushed_off:
+        return {"pushed_off_chair": True, "hands_on_chest": False, "no_arm_contact": False}
+    if hands_on_chest:
+        return {"pushed_off_chair": False, "hands_on_chest": True, "no_arm_contact": False}
+    return {"pushed_off_chair": False, "hands_on_chest": False, "no_arm_contact": True}
 
-    # 4. Угол наклона туловища (улучшенный расчет)
-    angle = _trunk_angle(df, stand)
-    
-    # 5. Дополнительные метрики
-    hip_delta = df.hip_y.iloc[stand] - df.hip_y.iloc[sit1]
-    
-    # Стабильность в вертикальном положении
-    stand_stability = 0.0
-    if stand + int(fps) < len(df):  # Анализ 1 секунды после вставания
-        stand_heights = df.hip_y.iloc[stand:stand + int(fps)]
-        stand_stability = np.std(stand_heights) / hip_delta if hip_delta > 0 else 0
 
-    # 6. Категория по 6.5.1.7 (уточненная логика)
-    if (t_up <= MAX_NORMAL_UP_S and fails == 0 and 
-        not uses_hands and arms_crossed and stand_stability < 0.1):
-        cat = 0  # норма
-    elif (fails <= 1 and t_up <= MAX_ACCEPT_UP_S and 
-          not uses_hands and stand_stability < 0.15):
-        cat = 1  # легкое
-    elif (fails <= 2 and t_up <= 7.0 and 
-          stand_stability < 0.2):
-        cat = 2  # умеренное
-    elif uses_hands or fails > 2 or stand_stability >= 0.2:
-        cat = 3  # выраженное
-    else:
-        cat = 4  # максимальная декомпенсация
+# ----------  Аномалии  ----------
+def detect_needed_assistance(keypoints: pd.DataFrame) -> bool:
+    hip = np.array([hip_height(keypoints, t) for t in range(len(keypoints))])
+    grad = np.gradient(hip)
+    z = np.abs((grad - np.mean(grad)) / (np.std(grad) + 1e-8))
+    return np.any(z > 3.0)
 
-    return {
-        "sit_start_sec": float(t1),
-        "stand_sec": float(t2),
-        "sit_end_sec": float(t3),
-        "t_up_sec": float(t_up),
-        "t_down_sec": float(t_down),
-        "cycle_duration_sec": float(cycle_duration),
-        "failed_attempts": int(fails),
-        "uses_hands": bool(uses_hands),
-        "arms_crossed": bool(arms_crossed),
-        "trunk_angle_deg": float(angle),
-        "hip_delta_px": float(hip_delta),
-        "stand_stability": float(stand_stability),  # новая метрика
-        "wrist_assist_ratio": float(wrist_low_ratio),  # для отладки
-        "category": cat,
-        "category_desc": ["норма", "лёгкое нарушение", "умеренное нарушение", 
-                         "выраженное нарушение", "максимальная декомпенсация"][cat]
+
+def calculate_score(completion_time: float, attempts: int, arm_status: dict, needed_assistance: bool) -> int:
+    """0 = отлично, 4 = максимальная декомпенсация"""
+    if needed_assistance:
+        return 4
+    if arm_status["pushed_off_chair"]:
+        return 3
+    if completion_time > 15.0:
+        return 2
+    if completion_time < 10.0 and arm_status["hands_on_chest"]:
+        return 0
+    return 1
+
+
+# ----------  Главная функция анализа  ----------
+def analyse(input_csv: str, min_cycle_duration: float, plot: bool):
+    try:
+        df = pd.read_csv(input_csv)
+    except Exception as e:
+        raise RuntimeError(f"Cannot read CSV: {e}")
+
+    required = ["frame", "time"] + [f"kp_{i}_{ax}" for i in range(17) for ax in ("x", "y")]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in CSV: {missing}")
+
+    df = df.rename(columns={c: normalize_keypoint_name(c) for c in df.columns if c.startswith("kp_")})
+    fps = len(df) / df["time"].iloc[-1]
+    if fps < 30:
+        print("Warning: sampling rate < 30 Hz, results may be inaccurate")
+
+    cycles = detect_cycles(df, fps, min_cycle_duration)
+    total_cycles = len(cycles)
+    if total_cycles == 0:
+        return {
+            "summary": {
+                "score": 0,
+                "description": "Циклы не обнаружены",
+                "completion_time": None,
+                "cycles_completed": 0,
+                "attempts": 1,
+                "arm_status": {"pushed_off_chair": False, "hands_on_chest": False, "no_arm_contact": True},
+                "needed_assistance": True,
+            },
+            "details": {"cycle_durations": [], "total_cycles_detected": 0},
+        }
+
+    relevant = cycles[:5]
+    durations = [d for _, _, d in relevant]
+    completion_time = sum(durations)
+
+    attempts = detect_attempts(df, fps)
+    arm_status = detect_arm_status(df)
+    needed_assistance = detect_needed_assistance(df)
+
+    score = calculate_score(completion_time, attempts, arm_status, needed_assistance)
+    descr_map = {
+        4: "Требовалась помощь",
+        3: "Опирался руками на сидушку",
+        2: "Медленное выполнение (>15 с)",
+        1: "Удовлетворительно (10–15 с или руки не на груди)",
+        0: "Отлично (<10 с, руки на груди)",
     }
-
-
-def _summary(cycles: List[Dict]) -> Dict:
-    if not cycles:
-        return {"cycles_found": 0}
-    cats = [c["category"] for c in cycles]
-    return {
-        "cycles_found":          len(cycles),
-        "mean_t_up_sec":         float(np.mean([c["t_up_sec"] for c in cycles])),
-        "median_category":       int(np.median(cats)),
-        "worst_category":        int(np.max(cats)),
-        "uses_hands_any":        any(c["uses_hands"] for c in cycles),
-        "total_failed_attempts": int(sum(c["failed_attempts"] for c in cycles))
-    }
-
-
-def analyse(csv_path: str,
-            min_cycle_duration: float = MIN_CYCLE_DURATION_S,
-            plot: bool = False) -> Dict:
-    df = load_keypoints(csv_path)
-    fps = 1 / np.diff(df.time).mean()
-    raw = _find_cycles(df, fps)
-    cycles = [_cycle_metrics(df, s1, st, s2, fps) for s1, st, s2 in raw
-              if (df.time.iloc[s2] - df.time.iloc[s1]) >= min_cycle_duration]
-    summary = _summary(cycles)
-    report = {"summary": summary, "cycles": cycles}
-
     if plot:
-        plt.figure(figsize=(12, 4))
-        plt.title("Высота центра таза (циклы)")
-        plt.plot(df.time, df.hip_y, color="silver", label="hip Y")
-        for c in cycles:
-            color = ["green", "yellow", "orange", "red", "darkred"][c["category"]]
-            plt.axvspan(c["sit_start_sec"], c["sit_end_sec"], alpha=0.25, color=color)
-        plt.xlabel("время, с")
+        plt.figure(figsize=(10, 4))
+        hip = [hip_height(df, t) for t in range(len(df))]
+        plt.plot(df["time"], hip, label="Hip height (smooth)")
+        for start, end, _ in relevant:
+            plt.axvspan(df["time"].iloc[start], df["time"].iloc[end], alpha=0.2, color="green")
+        plt.title("Detected cycles (hip height)")
+        plt.xlabel("Time, s")
         plt.ylabel("Y, px")
         plt.legend()
         plt.tight_layout()
         plt.show()
-    return report
 
-# Экспортируем функции для использования в других модулях
-def get_cycle_metrics(df: pd.DataFrame, sit1: int, stand: int, sit2: int, fps: float) -> Dict:
-    """Публичная версия функции _cycle_metrics"""
-    return _cycle_metrics(df, sit1, stand, sit2, fps)
+    return {
+        "summary": {
+            "score": score,
+            "description": descr_map[score],
+            "completion_time": round(completion_time, 2),
+            "cycles_completed": len(relevant),
+            "attempts": attempts,
+            "arm_status": arm_status,
+            "needed_assistance": bool(needed_assistance),
+        },
+        "details": {
+            "cycle_durations": [round(d, 2) for d in durations],
+            "total_cycles_detected": total_cycles,
+        },
+    }
 
-def get_summary(cycles: List[Dict]) -> Dict:
-    """Публичная версия функции _summary"""
-    return _summary(cycles)
 
+# ----------  CLI  ----------
 def main():
-    parser = argparse.ArgumentParser(description="Анализ циклов «вставание из кресла» по 6.5.1.7")
-    parser.add_argument("--input", required=True, help="CSV-файл с ключевыми точками")
+    parser = argparse.ArgumentParser(description="Анализ функциональной пробы «Вставание с кресла» (5 подъёмов)",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--input", required=True, help="CSV-файл с трекингом ключевых точек")
     parser.add_argument("--output", help="JSON-отчёт (по умолчанию: <input>_movement.json)")
-    parser.add_argument("--min-cycle-duration", type=float, default=MIN_CYCLE_DURATION_S)
-    parser.add_argument("--plot", action="store_true", help="Показать график")
+    parser.add_argument("--min-cycle-duration", type=float, default=1.0, help="Минимальная длительность цикла, с")
+    parser.add_argument("--plot", action="store_true", help="Показать графики")
     args = parser.parse_args()
 
-    out_path = args.output or (pathlib.Path(args.input).stem + "_movement.json")
+    if not Path(args.input).is_file():
+        print(f"Error: file not found {args.input}")
+        sys.exit(1)
+
+    out_path = args.output or str(Path(args.input).with_suffix("")) + "_movement.json"
     report = analyse(args.input, args.min_cycle_duration, args.plot)
-    pathlib.Path(out_path).write_text(json.dumps(report, ensure_ascii=False, indent=2))
-    print(f"Отчёт сохранён → {out_path}")
-    print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    print(f"Report saved to {out_path}")
+    print("Summary:")
+    for k, v in report["summary"].items():
+        if k == "arm_status":
+            print(f"  {k}: {v}")
+        else:
+            print(f"  {k}: {v}")
 
 
 if __name__ == "__main__":
